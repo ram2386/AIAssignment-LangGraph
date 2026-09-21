@@ -1,0 +1,21 @@
+# Core LangGraph and LangChain Framework
+langgraph>=1.2.0
+langchain>=1.4.0
+langchain-core>=1.6.0
+
+# Model Context Protocol (MCP) Adapters and SDK
+langchain-mcp-adapters>=0.3.0
+mcp>=1.30.0
+
+# LLM Providers
+langchain-google-genai>=4.4.0
+
+# Environment Management
+python-dotenv>=1.2.0
+
+# Search and Knowledge Backends for MCP Servers
+ddgs>=9.16.0
+wikipedia>=1.4.0
+
+# Testing
+pytest>=9.0.0
