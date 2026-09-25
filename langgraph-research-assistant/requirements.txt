@@ -9,6 +9,7 @@ mcp>=1.30.0
 
 # LLM Providers
 langchain-google-genai>=4.4.0
+langchain-mistralai>=1.1.0
 
 # Environment Management
 python-dotenv>=1.2.0

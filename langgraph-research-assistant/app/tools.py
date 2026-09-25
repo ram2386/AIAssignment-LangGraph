@@ -30,11 +30,7 @@ logger = logging.getLogger("research_assistant.tools")
 # ---------------------------------------------------------------------------
 # 1. DuckDuckGo FastMCP Server Definition
 # ---------------------------------------------------------------------------
-ddg_mcp = FastMCP("DuckDuckGoSearch")
-
-
-@ddg_mcp.tool()
-def search(query: str, max_results: int = 4) -> list[dict[str, str]]:
+def duckduckgo_search(query: str, max_results: int = 4) -> list[dict[str, str]]:
     """Search DuckDuckGo for live web information.
 
     Args:
@@ -58,6 +54,7 @@ def search(query: str, max_results: int = 4) -> list[dict[str, str]]:
         for item in raw_results:
             results.append(
                 {
+                    "source": "duckduckgo",
                     "title": item.get("title", ""),
                     "url": item.get("href", ""),
                     "content": item.get("body", ""),
@@ -67,6 +64,7 @@ def search(query: str, max_results: int = 4) -> list[dict[str, str]]:
         logger.warning(f"DuckDuckGo search failed for '{query}': {exc}")
         results.append(
             {
+                "source": "duckduckgo",
                 "title": f"Search Error for '{query}'",
                 "url": "",
                 "content": f"DuckDuckGo query encountered an error: {str(exc)}",
@@ -75,14 +73,13 @@ def search(query: str, max_results: int = 4) -> list[dict[str, str]]:
     return results
 
 
-# ---------------------------------------------------------------------------
-# 2. Wikipedia FastMCP Server Definition
-# ---------------------------------------------------------------------------
-wiki_mcp = FastMCP("WikipediaSearch")
+async def async_duckduckgo_search(query: str, max_results: int = 4) -> list[dict[str, str]]:
+    """Asynchronously execute DuckDuckGo search using asyncio.to_thread."""
+    import asyncio
+    return await asyncio.to_thread(duckduckgo_search, query, max_results)
 
 
-@wiki_mcp.tool()
-def search(query: str, max_results: int = 3) -> list[dict[str, str]]:
+def wikipedia_search(query: str, max_results: int = 3) -> list[dict[str, str]]:
     """Search Wikipedia for encyclopedic articles and summaries.
 
     Args:
@@ -110,6 +107,7 @@ def search(query: str, max_results: int = 3) -> list[dict[str, str]]:
                 )
                 results.append(
                     {
+                        "source": "wikipedia",
                         "title": page.title,
                         "url": getattr(page, "url", ""),
                         "content": summary_text,
@@ -124,6 +122,7 @@ def search(query: str, max_results: int = 3) -> list[dict[str, str]]:
                         )
                         results.append(
                             {
+                                "source": "wikipedia",
                                 "title": sub_page.title,
                                 "url": getattr(sub_page, "url", ""),
                                 "content": sub_page.summary[:1500],
@@ -140,12 +139,59 @@ def search(query: str, max_results: int = 3) -> list[dict[str, str]]:
         logger.warning(f"Wikipedia search failed for '{query}': {exc}")
         results.append(
             {
+                "source": "wikipedia",
                 "title": f"Wikipedia Error for '{query}'",
                 "url": "",
                 "content": f"Wikipedia search encountered an error: {str(exc)}",
             }
         )
     return results
+
+
+async def async_wikipedia_search(query: str, max_results: int = 3) -> list[dict[str, str]]:
+    """Asynchronously execute Wikipedia search using asyncio.to_thread."""
+    import asyncio
+    return await asyncio.to_thread(wikipedia_search, query, max_results)
+
+
+# ---------------------------------------------------------------------------
+# 1. DuckDuckGo FastMCP Server Definition
+# ---------------------------------------------------------------------------
+ddg_mcp = FastMCP("DuckDuckGoSearch")
+
+
+@ddg_mcp.tool()
+def search(query: str, max_results: int = 4) -> list[dict[str, str]]:
+    """Search DuckDuckGo for live web information.
+
+    Args:
+        query: The search query string.
+        max_results: Maximum number of search results to return (default: 4).
+
+    Returns:
+        A list of dictionaries with keys: title, url, content.
+    """
+    return duckduckgo_search(query, max_results)
+
+
+# ---------------------------------------------------------------------------
+# 2. Wikipedia FastMCP Server Definition
+# ---------------------------------------------------------------------------
+wiki_mcp = FastMCP("WikipediaSearch")
+
+
+@wiki_mcp.tool()
+def search(query: str, max_results: int = 3) -> list[dict[str, str]]:
+    """Search Wikipedia for encyclopedic articles and summaries.
+
+    Args:
+        query: The article or concept name to look up.
+        max_results: Maximum number of Wikipedia pages to summarize (default: 3).
+
+    Returns:
+        A list of dictionaries with keys: title, url, content.
+    """
+    return wikipedia_search(query, max_results)
 
 
 # ---------------------------------------------------------------------------

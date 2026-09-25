@@ -2,22 +2,19 @@
 
 A production-structured, beginner-friendly **Multi-Agent Research Assistant** built in Python using **LangGraph**, **LangChain**, and the **Model Context Protocol (MCP)** via `langchain-mcp-adapters`.
 
-This project demonstrates the core foundational concepts of agentic graph orchestration: shared state, specialized agent nodes, fan-out parallel branches, fan-in synchronization barriers, dynamic conditional routing, automatic retry handling, and grounded final answer synthesis.
+This project demonstrates core foundational and advanced concepts of agentic graph orchestration:
+- **Shared State Management** with conflict-free reducers (`typing.Annotated`).
+- **Specialized Agent Nodes** for decomposition, retrieval, synthesis, and presentation.
+- **Subgraph Modularization** encapsulating parallel retrieval and retry logic into an independent reusable graph.
+- **State Persistence & Checkpointing** using `InMemorySaver` with configurable `thread_id` sessions.
+- **Human-in-the-Loop (HITL)** decision gating via native LangGraph `interrupt()` and `Command(resume=...)`.
+- **Dynamic Conditional Routing** for approval, rejection, and iterative revision loops.
 
 ---
 
-## 1. What is LangGraph?
+## 1. Architecture
 
-**LangGraph** is an open-source orchestration framework designed for building stateful, multi-actor applications with LLMs. Unlike traditional sequential chains or monolithic agent loops:
-
-* Applications are modeled explicitly as a **graph** composed of **Nodes** (agent tasks or functions) and **Edges** (transitions).
-* A **Shared State** dictionary is passed from node to node. When a node executes, it returns partial updates that are applied to the state.
-* **Parallel Execution** is a first-class citizen: branching a graph triggers concurrent async operations, automatically synchronizing at downstream join points.
-* **Cycles and Conditional Edges** allow agents to inspect output, evaluate quality, and loop back (e.g. for retries or refinement) without infinite loops.
-
----
-
-## 2. Architecture
+### Enhanced Modular Architecture
 
 ```text
                                ┌──────────────┐
@@ -25,112 +22,211 @@ This project demonstrates the core foundational concepts of agentic graph orches
                                └──────┬───────┘
                                       │
                                       ▼
-                          ┌─────────────────────┐
-                          │   Planning Agent    │
-                          │                     │
-                          │  question → plan    │
-                          └──────────┬──────────┘
-                                     │
-                           Parallel branches (fan-out)
-                             ┌───────┴───────┐
-                             │               │
-                             ▼               ▼
-                    ┌────────────────┐ ┌────────────────┐
-                    │ DuckDuckGo     │ │ Wikipedia      │
-                    │ Retrieval      │ │ Retrieval      │
-                    │ Agent (MCP)    │ │ Agent (MCP)    │
-                    └───────┬────────┘ └───────┬────────┘
-                            │                  │
-                            └────────┬─────────┘
-                                     │ Fan-in synchronization barrier
-                                     ▼
-                          ┌─────────────────────┐
-                          │  Conditional Check  │
-                          │                     │
-                          │ Results available?  │
-                          └──────────┬──────────┘
-                                     │
-                          ┌──────────┴──────────┐
-                          │                     │
-                        Retry                Continue
-                 (retry_count < 2)       (results found or
-                          │               max retries hit)
-                          │                     │
-                          │                     ▼
-                          │           ┌──────────────────┐
-                          │           │ Summarizer Agent │
-                          │           └────────┬─────────┘
-                          │                    │
-                          │                    ▼
-                          │           ┌──────────────────┐
-                          │           │ Final Answer     │
-                          │           │ Agent            │
-                          │           └────────┬─────────┘
-                          │                    │
-                          │                    ▼
-                          │                  END
-                          │
-                          └─> [Parallel Retry Retrieval]
+                           ┌─────────────────────┐
+                           │   Planning Agent    │
+                           │                     │
+                           │  question → plan    │
+                           └──────────┬──────────┘
+                                      │
+                                      ▼
+                      ┌─────────────────────────────────┐
+                      │    Retrieval Subgraph (MCP)     │
+                      │  ┌───────────────────────────┐  │
+                      │  │ START                     │  │
+                      │  │   ├──→ DuckDuckGo Agent   │  │
+                      │  │   └──→ Wikipedia Agent    │  │
+                      │  │           │               │  │
+                      │  │           ▼ (fan-in)      │  │
+                      │  │      check_results        │  │
+                      │  │           │               │  │
+                      │  │      [retry loop]         │  │
+                      │  │      ├── retry (retries<2)│  │
+                      │  │      └── complete ───────→│  │
+                      │  │                          END │
+                      │  └───────────────────────────┘  │
+                      └───────────────┬─────────────────┘
+                                      │
+                                      ▼
+                           ┌─────────────────────┐
+                           │  Summarizer Agent   │
+                           │                     │
+                           │ synthesizes summary │
+                           └──────────┬──────────┘
+                                      │
+                                      ▼
+                           ┌─────────────────────┐  ◄───────────────────┐
+                           │   Human Approval    │                      │
+                           │    (HITL Gate)      │                      │
+                           │                     │                      │
+                           │     interrupt()     │                      │
+                           └──────────┬──────────┘                      │
+                                      │                                 │
+                         [Approval Decision Route]                      │
+                                      │                                 │
+                       ┌──────────────┴──────────────┐                  │
+          (Rejected: human_approved == False)        │ (Approved)       │
+                       │                             │                  │
+                       ▼                             ▼                  │
+            ┌──────────────────┐           ┌──────────────────┐         │
+            │  Revision Agent  │           │   Final Answer   │         │
+            │                  │           │      Agent       │         │
+            │ applies feedback │           │                  │         │
+            └──────────┬───────┘           │ compiles answer  │         │
+                       │                   └─────────┬────────┘         │
+                       │                             │                  │
+                       └─────────────────────────────┼──────────────────┘
+                                                     │
+                                                     ▼
+                                                    END
 ```
 
 ---
 
-## 3. Project Structure
+## 2. Project Structure
 
 ```text
 langgraph-research-assistant/
 │
 ├── app/
-│   ├── __init__.py           # Package marker
-│   ├── state.py              # Typed shared state schema and merge reducers
-│   ├── agents.py             # 5 specialized agents + evaluation node
-│   ├── tools.py              # FastMCP servers & MultiServerMCPClient loader
-│   ├── graph.py              # LangGraph definition, edges, conditional routing
-│   └── main.py               # Interactive CLI interface
+│   ├── __init__.py              # Package marker
+│   ├── state.py                 # Typed shared state schema and merge reducers
+│   ├── agents.py                # Specialized agents, HITL approval node & revision agent
+│   ├── retrieval_subgraph.py    # Subgraph encapsulating parallel retrieval & retry loop
+│   ├── tools.py                 # FastMCP servers & MultiServerMCPClient loader
+│   ├── graph.py                 # Parent LangGraph definition, checkpointer & routing
+│   └── main.py                  # Interactive CLI with HITL prompt & thread persistence
 │
 ├── tests/
-│   ├── __init__.py           # Test package marker
-│   └── test_graph.py         # Unit tests for state, routing, retry, and graph
+│   ├── __init__.py              # Test package marker
+│   └── test_graph.py            # Unit & integration tests (16 tests covering all features)
 │
-├── .env.example              # Environment variable template
-├── .gitignore                # Git exclusions
-├── requirements.txt          # Minimal, pinned dependencies
-└── README.md                 # Complete documentation
+├── .env.example                 # Environment variable template
+├── .gitignore                   # Git exclusions
+├── requirements.txt             # Pinned project dependencies
+└── README.md                    # Complete documentation
 ```
 
 ### Module Responsibilities
 
-* **`app/state.py`**: Defines `ResearchState(TypedDict)` containing `question`, `research_plan`, `search_results`, `duckduckgo_results`, `wikipedia_results`, `summary`, `final_answer`, `retry_count`, and `errors`. Implements `merge_search_results` reducer for conflict-free parallel updates.
-* **`app/tools.py`**: Embeds two open-source `FastMCP` servers (`DuckDuckGo` and `Wikipedia`) that communicate via `stdio`. Connects agents to these tools dynamically using `MultiServerMCPClient`.
+* **`app/state.py`**: Defines `ResearchState(TypedDict)` tracking `question`, `research_plan`, `search_results`, `duckduckgo_results`, `wikipedia_results`, `summary`, `final_answer`, `retry_count`, `errors`, `human_approved`, and `human_feedback`. Uses conflict-free reducers (`operator.add`, `merge_search_results`).
+* **`app/retrieval_subgraph.py`**: Encapsulates `duckduckgo`, `wikipedia`, and `check_results` evaluation into an independent reusable `StateGraph`. Routes back for retry or exits to `END`.
 * **`app/agents.py`**: Implements specialized functional nodes:
   * **Planning Agent**: Deconstructs questions into structured research tasks.
-  * **DuckDuckGo Retrieval Agent**: Runs live web queries using DuckDuckGo MCP tool.
-  * **Wikipedia Retrieval Agent**: Queries encyclopedia articles using Wikipedia MCP tool.
-  * **Evaluate Retrieval Node**: Tracks retrieval success and increments retry counters.
-  * **Summarizer Agent**: Synthesizes and cross-references evidence from both sources.
-  * **Final Answer Agent**: Formats user response with Answer, Key Findings, and Sources.
-* **`app/graph.py`**: Assembles the `StateGraph`, registers nodes, links parallel edges, configures the conditional retry route, and compiles the workflow.
-* **`app/main.py`**: Provides the interactive CLI and direct `--question` command-line flag.
-* **`tests/test_graph.py`**: Validates state reducers, planner output, routing logic, retry bounds, and end-to-end graph compilation.
+  * **DuckDuckGo Retrieval Agent**: Runs live web queries via DuckDuckGo FastMCP server.
+  * **Wikipedia Retrieval Agent**: Queries encyclopedia articles via Wikipedia FastMCP server.
+  * **Evaluate Retrieval Node**: Checks document presence and manages retry budget.
+  * **Summarizer Agent**: Synthesizes and cross-references evidence across sources.
+  * **Human Approval Node**: Invokes `interrupt()` with structured review data and captures feedback.
+  * **Revision Agent**: Refines the research summary using reviewer feedback.
+  * **Final Answer Agent**: Formats user response into Answer, Key Findings, and Sources.
+* **`app/graph.py`**: Assembles the parent `StateGraph`, mounts the compiled `retrieval_subgraph`, connects the human approval gate and revision loop, and attaches `InMemorySaver` checkpointer.
+* **`app/main.py`**: Command-line application managing execution threads, detecting interrupts, rendering human review prompts, and resuming via `Command(resume=...)`.
+* **`tests/test_graph.py`**: 16 automated tests covering state reducers, planner, retry routing, subgraph execution, persistence, interrupts, approvals, and iterative revisions.
 
 ---
 
-## 4. LangGraph Concepts Demonstrated
+## 3. Core Concepts & Contracts
 
-| Concept | Location in Code | How It Works |
-|---|---|---|
-| **State Management** | [`app/state.py`](app/state.py) | Defines `ResearchState(TypedDict)`. Uses `Annotated[list[dict], merge_search_results]` so parallel branches can update search results simultaneously without `InvalidUpdateError`. |
-| **Nodes** | [`app/agents.py`](app/agents.py) | Each agent is an async function that receives `state: ResearchState` and returns a dictionary of state updates. |
-| **Edges** | [`app/graph.py`](app/graph.py) | `builder.add_edge(START, "planner")` and `builder.add_edge("summarizer", "final_answer")` establish deterministic transitions. |
-| **Parallel Execution (Fan-out)** | [`app/graph.py`](app/graph.py) | `planner` has outgoing edges to both `duckduckgo` and `wikipedia`. LangGraph executes both nodes concurrently. |
-| **Synchronization Barrier (Fan-in)** | [`app/graph.py`](app/graph.py) | Both `duckduckgo` and `wikipedia` connect into `check_results`. LangGraph automatically waits for **both** to finish before executing the check node. |
-| **Conditional Routing** | [`app/graph.py`](app/graph.py) | `add_conditional_edges("check_results", route_retrieval, ...)` evaluates whether search documents were found. |
-| **Retry Handling** | [`app/graph.py`](app/graph.py), [`app/agents.py`](app/agents.py) | If results are empty and `retry_count < MAX_RETRIES` (default 2), it routes back to `['duckduckgo', 'wikipedia']` with broadened search terms. When max retries are reached, it gracefully moves forward to summarization. |
-| **Final Answer Synthesis** | [`app/agents.py`](app/agents.py) | Grounded strictly on retrieved documents, formatting Answer, Key Findings, and clickable Source citations. |
+### 3.1 Persistence & Checkpoints
+
+LangGraph checkpointing captures execution snapshots at each superstep. This project attaches `InMemorySaver` to the compiled graph:
+
+```python
+from langgraph.checkpoint.memory import InMemorySaver
+
+builder = build_research_graph()
+graph = builder.compile(checkpointer=InMemorySaver())
+```
+
+#### Thread ID Contract
+Every execution is associated with a configurable `thread_id`:
+
+```python
+config = {"configurable": {"thread_id": "session-1234"}}
+```
+
+- **Initial Execution**: `await graph.ainvoke(initial_state, config=config)` runs until completion or until an `interrupt()` is encountered.
+- **Resume Execution**: `await graph.ainvoke(Command(resume=resume_data), config=config)` resumes execution from the exact checkpoint on that thread.
+- **Node Idempotency**: Resumed workflows do not re-execute previously completed upstream nodes (e.g. `planner`, `retrieval_subgraph`, `summarizer`).
 
 ---
 
-## 5. Installation
+### 3.2 Human-in-the-Loop (HITL)
+
+Human review is positioned after the Summarizer Agent produces a research synthesis, before the Final Answer Agent compiles the public response.
+
+#### Interrupt Contract (Graph → Application)
+Inside `human_approval_node`:
+
+```python
+response = interrupt({
+    "type": "approval",
+    "message": "Please review the generated research summary.",
+    "data": {
+        "result": state["summary"],
+        "summary": state["summary"],
+        "question": state["question"],
+    },
+})
+```
+
+- When `interrupt()` is called, LangGraph suspends the thread, writes a checkpoint, and halts execution before any downstream nodes run.
+- The payload is strictly serializable JSON-compatible data.
+- **No blocking `input()` calls exist inside graph nodes**, preserving cross-platform reusability (CLI, FastAPI, Web UI).
+
+#### Resume Contract (Application → Graph)
+The application layer prompts the human and resumes the thread using `Command`:
+
+```python
+from langgraph.types import Command
+
+command = Command(
+    resume={
+        "approved": True,       # True to accept, False to reject
+        "feedback": None        # Optional revision instructions
+    }
+)
+await graph.ainvoke(command, config=config)
+```
+
+The resume dictionary becomes the return value of `interrupt()` inside `human_approval_node`.
+
+---
+
+### 3.3 Approval & Rejection Routing
+
+The parent graph routes dynamically based on `state["human_approved"]`:
+
+```python
+def route_approval(state: ResearchState) -> str:
+    if state.get("human_approved"):
+        return "final_answer"
+    return "revision"
+```
+
+1. **Approval**:
+   - `human_approved` is `True`.
+   - Routes to `final_answer` agent.
+   - Final response is formatted and graph terminates at `END`.
+2. **Rejection**:
+   - `human_approved` is `False`.
+   - Routes to `revision` agent with `human_feedback`.
+   - Summary is re-synthesized taking the reviewer's instructions into account.
+   - Routes back to `human_approval_node` for re-evaluation.
+   - Supports unlimited revision cycles until approved.
+
+---
+
+### 3.4 Subgraph Modularization
+
+The parallel search and retry logic is encapsulated in `app/retrieval_subgraph.py`:
+- **Why a Subgraph?** DuckDuckGo and Wikipedia retrieval, synchronization, and retry counting form a self-contained, cohesive subsystem.
+- **Clean Parent Boundary**: The parent graph treats the entire search subsystem as a single modular node (`retrieval_subgraph`), improving maintainability and testability.
+- **Encapsulated Retries**: Retries loop internally within the subgraph, avoiding cluttered edges in the top-level orchestration graph.
+
+---
+
+## 4. Installation & Setup
 
 ### Prerequisites
 
@@ -151,15 +247,10 @@ langgraph-research-assistant/
      python3 -m venv .venv
      source .venv/bin/activate
      ```
-   * **Windows (Command Prompt):**
+   * **Windows:**
      ```cmd
      python -m venv .venv
      .venv\Scripts\activate.bat
-     ```
-   * **Windows (PowerShell):**
-     ```powershell
-     python -m venv .venv
-     .venv\Scripts\Activate.ps1
      ```
 
 3. **Install dependencies:**
@@ -167,36 +258,15 @@ langgraph-research-assistant/
    pip install -r requirements.txt
    ```
 
----
-
-## 6. Configuration
-
-Create your local `.env` file from `.env.example`:
-
-```bash
-cp .env.example .env
-```
-
-Edit `.env` and set your credentials:
-
-```env
-# Choose LLM Provider: gemini (default), groq, mistral, or mock
-LLM_PROVIDER=gemini
-
-# Google Gemini API Key (Get at: https://aistudio.google.com/)
-GOOGLE_API_KEY=your_google_api_key_here
-GEMINI_MODEL=gemini-2.5-flash
-
-# Maximum retrieval retries
-MAX_RETRIES=2
-```
-
-> **Note on Offline / Mock Mode**:
-> If you do not have an API key or wish to run tests without internet LLM charges, leave `LLM_PROVIDER=mock` (or leave `GOOGLE_API_KEY` blank). The assistant will operate using deterministic heuristic synthesis.
+4. **Configure environment:**
+   ```bash
+   cp .env.example .env
+   ```
+   Edit `.env` to configure your LLM provider (`gemini`, `groq`, `mistral`, or `mock`). If left blank or set to `mock`, the system operates in graceful offline mode.
 
 ---
 
-## 7. Running the Application
+## 5. Running the Application
 
 ### Interactive CLI Mode
 
@@ -204,97 +274,103 @@ MAX_RETRIES=2
 python -m app.main
 ```
 
-You will see:
-```text
-============================================================
-        LANGGRAPH MULTI-AGENT RESEARCH ASSISTANT
-============================================================
-Provider: GEMINI | Python: 3.14.6
-============================================================
-
-Enter your research question:
-> What are the advantages of Model Context Protocol for AI agents?
-```
-
-### Direct Question Mode (One-Shot)
+### Direct Question Mode with Custom Session Thread ID
 
 ```bash
-python -m app.main --question "What are the benefits of Model Context Protocol for AI agents?"
+python -m app.main --question "What are the benefits of Model Context Protocol?" --thread-id "mcp-session-01"
 ```
 
----
+### Demonstration of Human-in-the-Loop Workflow
 
-## 8. Example Output
+When executed, the system pauses at the human approval gate:
 
 ```text
-============================================================
-RESEARCH RESULTS
-============================================================
-
-[Question]:
-What are the benefits of Model Context Protocol for AI agents?
-
-[Research Plan]:
-  1. Understand what Model Context Protocol (MCP) is
-  2. Identify the main benefits and architectural advantages of MCP
-  3. Identify limitations or security considerations of MCP
-  4. Compare MCP with traditional ad-hoc tool integrations
-
-[Research Summary]:
-Model Context Protocol (MCP) is an open-source standard created by Anthropic to unify
-how AI models connect to external tools, databases, and APIs.
-- DuckDuckGo live sources highlight its role as the 'USB-C for AI', replacing fragmented
-  custom API integrations with standardized stdio and HTTP JSON-RPC transports.
-- Wikipedia and documentation articles emphasize security isolation, client-host-server
-  architecture, and seamless tool portability across different AI agents.
-
-[Final Answer]:
-## Answer
-The Model Context Protocol (MCP) provides a standardized, open specification that
-transforms how AI agents interact with external data and tools. By creating a unified
-client-server abstraction over standard transports (stdio and streamable HTTP), MCP replaces
-bespoke API wrappers with reusable, portable tool servers.
-
-## Key Findings
-- **Standardized Integration**: Eliminates repetitive custom connectors for each LLM provider.
-- **Enhanced Security**: Servers run in isolated subprocesses with explicit boundary controls.
-- **Ecosystem Portability**: Tools built for MCP can be shared across Claude, LangGraph, Cursor, and custom agents.
-- **Dynamic Discovery**: Agents query tools, resources, and prompts at runtime.
-
-## Sources
-- [Model Context Protocol Specification](https://modelcontextprotocol.io) (Duckduckgo)
-- [Anthropic Introduces MCP](https://www.anthropic.com/news/model-context-protocol) (Duckduckgo)
-- [Model Context Protocol](https://en.wikipedia.org/wiki/Model_Context_Protocol) (Wikipedia)
+[GRAPH] Workflow started
+[GRAPH] Checkpointing enabled (thread_id: 'mcp-session-01')
+[GRAPH] Subgraph started
+[GRAPH] Subgraph completed
+[Summarizer] Combining research and synthesizing summary...
+[GRAPH] Waiting for human approval
+[GRAPH] Workflow interrupted
 
 ============================================================
+HUMAN APPROVAL REQUIRED
+============================================================
+Please review the generated research summary.
+
+Generated Result:
+------------------------------------------------------------
+### Research Synthesis for: 'What are the benefits of Model Context Protocol?'
+Synthesized evidence from DuckDuckGo web results and Wikipedia articles...
+------------------------------------------------------------
+
+Approve? (y/n): n
+Feedback: Please emphasize the stdio transport security model.
+
+[GRAPH] Resuming workflow (thread_id: 'mcp-session-01')
+[GRAPH] Human rejected result
+[GRAPH] Human feedback received: Please emphasize the stdio transport security model.
+[GRAPH] Starting revision
+[Revision] Summary revision completed.
+[GRAPH] Waiting for human approval
+[GRAPH] Workflow interrupted
+
+============================================================
+HUMAN APPROVAL REQUIRED
+============================================================
+...
+**[Revision Applied - Human Feedback]:** Please emphasize the stdio transport security model.
+------------------------------------------------------------
+
+Approve? (y/n): y
+[GRAPH] Resuming workflow (thread_id: 'mcp-session-01')
+[GRAPH] Human approved
+[Final Answer] Generating response with sources...
+
+============================================================
+FINAL RESEARCH RESULTS
+============================================================
+[Human Review Status]: Approved
+[Latest Human Feedback]: Please emphasize the stdio transport security model.
+...
 ```
 
 ---
 
-## 9. Running Tests
+## 6. Running Tests
 
-Run the comprehensive test suite with `pytest`:
+Run the full test suite with `pytest`:
 
 ```bash
 pytest tests/ -v
 ```
 
-All 9 unit and integration tests execute offline in milliseconds:
+All 16 tests pass deterministically:
+
 ```text
-tests/test_graph.py::test_create_initial_state PASSED                    [ 11%]
-tests/test_graph.py::test_merge_search_results_deduplication PASSED      [ 22%]
-tests/test_graph.py::test_planning_agent_produces_non_empty_plan PASSED  [ 33%]
-tests/test_graph.py::test_route_retrieval_with_results PASSED            [ 44%]
-tests/test_graph.py::test_route_retrieval_without_results_triggers_retry PASSED [ 55%]
-tests/test_graph.py::test_route_retrieval_retry_limit_exceeded PASSED    [ 66%]
-tests/test_graph.py::test_evaluate_retrieval_increments_retry_count PASSED [ 77%]
-tests/test_graph.py::test_graph_compiles_successfully PASSED             [ 88%]
-tests/test_graph.py::test_full_graph_execution_mocked PASSED             [100%]
+tests/test_graph.py::test_create_initial_state PASSED                    [  6%]
+tests/test_graph.py::test_merge_search_results_deduplication PASSED      [ 12%]
+tests/test_graph.py::test_planning_agent_produces_non_empty_plan PASSED  [ 18%]
+tests/test_graph.py::test_route_retrieval_with_results PASSED            [ 25%]
+tests/test_graph.py::test_route_retrieval_without_results_triggers_retry PASSED [ 31%]
+tests/test_graph.py::test_route_retrieval_retry_limit_exceeded PASSED    [ 37%]
+tests/test_graph.py::test_evaluate_retrieval_increments_retry_count PASSED [ 43%]
+tests/test_graph.py::test_graph_compiles_successfully PASSED             [ 50%]
+tests/test_graph.py::test_full_graph_execution_mocked PASSED             [ 56%]
+tests/test_graph.py::test_persistence_and_checkpoints PASSED             [ 62%]
+tests/test_graph.py::test_interrupt_pauses_execution_and_contains_payload PASSED [ 68%]
+tests/test_graph.py::test_approval_resumes_to_final_answer PASSED        [ 75%]
+tests/test_graph.py::test_rejection_routes_to_revision_and_reapproval PASSED [ 81%]
+tests/test_graph.py::test_multiple_rejections_then_approval PASSED       [ 87%]
+tests/test_graph.py::test_retrieval_subgraph_execution_standalone PASSED [ 93%]
+tests/test_graph.py::test_subgraph_output_reaches_parent_graph PASSED    [100%]
+
+============================= 16 passed in 12.65s ==============================
 ```
 
 ---
 
-## 10. MCP Server Setup Details
+## 7. MCP Server Setup Details
 
 This project uses the official Python MCP SDK with `langchain-mcp-adapters`:
 
@@ -308,18 +384,10 @@ This project uses the official Python MCP SDK with `langchain-mcp-adapters`:
    - `python -m app.tools --server wikipedia`
    These processes communicate using standard JSON-RPC over stdin/stdout.
 3. **Custom External MCP Servers**:
-   If you wish to point to external MCP servers (such as `uvx duckduckgo-mcp-server` or `npx @modelcontextprotocol/server-wikipedia`), you can simply specify them in `.env`:
+   You can easily configure external MCP servers in `.env`:
    ```env
    DUCKDUCKGO_MCP_COMMAND=uvx
    DUCKDUCKGO_MCP_ARGS=duckduckgo-mcp-server
    WIKIPEDIA_MCP_COMMAND=npx
    WIKIPEDIA_MCP_ARGS=-y wikipedia-mcp
    ```
-
----
-
-## 11. Known Limitations & Extensibility
-
-* **Web Search Rate Limits**: DuckDuckGo's public endpoint may occasionally throttle high-frequency requests. The retry mechanism automatically broadens search terms when zero items are returned.
-* **Wikipedia Disambiguation**: Some broad search queries may map to disambiguation pages; the agent automatically selects the first primary page candidate.
-* **Extensibility**: You can easily add more specialized retrieval agents (e.g. ArXiv, GitHub, PubMed) by adding an MCP server in `tools.py`, creating a specialized agent in `agents.py`, and linking it as a parallel branch in `graph.py`.

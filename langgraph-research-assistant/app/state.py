@@ -98,6 +98,14 @@ class ResearchState(TypedDict):
         errors:
             A cumulative list of non-fatal warnings or error messages encountered
             during tool execution or LLM generation. Uses `operator.add`.
+
+        human_approved:
+            Boolean flag indicating whether the human reviewer approved the research
+            summary, or None if awaiting review.
+
+        human_feedback:
+            Optional feedback or revision instructions provided by the human reviewer
+            upon rejection, or None.
     """
 
     question: str
@@ -109,6 +117,8 @@ class ResearchState(TypedDict):
     final_answer: str
     retry_count: int
     errors: Annotated[list[str], operator.add]
+    human_approved: bool | None
+    human_feedback: str | None
 
 
 def create_initial_state(question: str) -> ResearchState:
@@ -130,4 +140,7 @@ def create_initial_state(question: str) -> ResearchState:
         "final_answer": "",
         "retry_count": 0,
         "errors": [],
+        "human_approved": None,
+        "human_feedback": None,
     }
+

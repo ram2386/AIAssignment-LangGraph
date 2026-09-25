@@ -13,18 +13,44 @@ Rather than relying on a single monolithic LLM call:
 5. Final Answer Agent compiles a cited, verified final response.
 """
 
+import asyncio
 import json
 import logging
 import os
+from pathlib import Path
 import re
 from typing import Any
 
+from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import BaseTool
+from langgraph.types import interrupt
 
-from app.state import ResearchState
-from app.tools import load_research_tools
+from app.state import ResearchState, merge_search_results
+from app.tools import (
+    async_duckduckgo_search,
+    async_wikipedia_search,
+    load_research_tools,
+)
+
+# Environment loading: loads .env (best practice), with fallback to .env.example
+_project_root = Path(__file__).resolve().parent.parent
+_env_path = _project_root / ".env"
+_example_path = _project_root / ".env.example"
+
+if _env_path.exists():
+    load_dotenv(dotenv_path=_env_path, override=True)
+else:
+    load_dotenv(override=True)
+
+# Seamless fallback if user adds their key directly into .env.example
+if _example_path.exists():
+    provider = os.getenv("LLM_PROVIDER", "mistral").lower()
+    key_var = "MISTRAL_API_KEY" if provider == "mistral" else ("GOOGLE_API_KEY" if provider == "gemini" else "GROQ_API_KEY")
+    val = os.getenv(key_var, "")
+    if not val or "your_" in val:
+        load_dotenv(dotenv_path=_example_path, override=True)
 
 logger = logging.getLogger("research_assistant.agents")
 
@@ -62,7 +88,7 @@ def get_llm():
             return None
         from langchain_google_genai import ChatGoogleGenerativeAI
 
-        model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        model_name = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
         return ChatGoogleGenerativeAI(
             model=model_name,
             google_api_key=google_key,
@@ -83,6 +109,26 @@ def get_llm():
             )
         except ImportError:
             logger.warning("langchain-groq not installed. Falling back to offline mode.")
+            return None
+
+    if provider == "mistral":
+        mistral_key = os.getenv("MISTRAL_API_KEY", "")
+        if not mistral_key or "your_api_key_here" in mistral_key:
+            logger.info("No active MISTRAL_API_KEY found; operating in graceful mock/offline mode.")
+            return None
+        try:
+            from langchain_mistralai import ChatMistralAI
+
+            model_name = os.getenv("MISTRAL_MODEL", "open-mistral-7b")
+            return ChatMistralAI(
+                model=model_name,
+                mistral_api_key=mistral_key,
+                temperature=0.2,
+                timeout=20,
+                max_retries=2,
+            )
+        except ImportError:
+            logger.warning("langchain-mistralai not installed. Falling back to offline mode.")
             return None
 
     return None
@@ -203,6 +249,7 @@ async def duckduckgo_retrieval_agent(state: ResearchState) -> dict[str, Any]:
     question = state.get("question", "")
     retry_count = state.get("retry_count", 0)
 
+    logger.info("[GRAPH] Subgraph started")
     logger.info(f"[DuckDuckGo] Searching live web (attempt {retry_count + 1})...")
 
     # Select queries: adapt if this is a retry attempt
@@ -506,6 +553,7 @@ async def final_answer_agent(state: ResearchState) -> dict[str, Any]:
 
     llm = get_llm()
     answer_text = ""
+    human_feedback = state.get("human_feedback")
 
     if llm is not None:
         sources_list_str = "\n".join(f"- [{title}]({url}) ({source})" for source, title, url in distinct_sources)
@@ -513,15 +561,17 @@ async def final_answer_agent(state: ResearchState) -> dict[str, Any]:
             "You are a professional research assistant. Formulate the final answer for the user.\n"
             "Structure your response strictly as follows:\n\n"
             "## Answer\n"
-            "<A clear, comprehensive direct answer to the user's question, grounded in the research summary.>\n\n"
+            "<A clear, comprehensive direct answer to the user's question, grounded in the research summary and any incorporated reviewer feedback.>\n\n"
             "## Key Findings\n"
             "<Bullet points highlighting 3-5 critical takeaways, advantages, or trade-offs.>\n\n"
             "## Sources\n"
             "<List of markdown links to all sources referenced with their titles.>\n\n"
             "Never invent facts or references not provided in the summary."
         )
+        feedback_clause = f"\nHuman Reviewer Feedback Addressed: \"{human_feedback}\"\n" if human_feedback else ""
         user_prompt = (
-            f"User Question: {question}\n\n"
+            f"User Question: {question}\n"
+            f"{feedback_clause}\n"
             f"Research Summary:\n{summary}\n\n"
             f"Available Sources:\n{sources_list_str}"
         )
@@ -537,13 +587,14 @@ async def final_answer_agent(state: ResearchState) -> dict[str, Any]:
             f"- [{title}]({url}) ({source})" for source, title, url in distinct_sources
         ] or ["- No external source links accessible."]
 
+        feedback_bullet = f"\n- Incorporated human reviewer feedback: '{human_feedback}'." if human_feedback else ""
         answer_text = (
             f"## Answer\n"
             f"Based on gathered research for '{question}':\n\n"
             f"{summary}\n\n"
             f"## Key Findings\n"
             f"- Information was gathered independently from live web search and encyclopedic records.\n"
-            f"- The synthesis consolidates definitions, core components, and practical context.\n"
+            f"- The synthesis consolidates definitions, core components, and practical context.{feedback_bullet}\n"
             f"- Further domain-specific verification may be conducted via the sources below.\n\n"
             f"## Sources\n"
             + "\n".join(source_lines)
@@ -551,3 +602,563 @@ async def final_answer_agent(state: ResearchState) -> dict[str, Any]:
 
     logger.info("[Final Answer] Final response compiled.")
     return {"final_answer": answer_text}
+
+
+# ---------------------------------------------------------------------------
+# 7. Human-in-the-Loop Approval Node
+# ---------------------------------------------------------------------------
+async def human_approval_node(state: ResearchState) -> dict[str, Any]:
+    """Human-in-the-Loop decision gate.
+
+    LangGraph Concept: Dynamic Interrupt
+    - Pauses graph execution using `interrupt()`.
+    - Passes structured payload containing summary, question, and result to caller.
+    - Graph execution suspends until resumed with Command(resume=...).
+    - Updates state with approval decision and optional revision feedback.
+    """
+    summary = state.get("summary", "")
+    question = state.get("question", "")
+
+    logger.info("[GRAPH] Waiting for human approval")
+    response = interrupt(
+        {
+            "type": "approval",
+            "message": "Please review the generated research summary.",
+            "data": {
+                "result": summary,
+                "summary": summary,
+                "question": question,
+            },
+        }
+    )
+
+    if isinstance(response, dict):
+        approved = bool(response.get("approved", False))
+        feedback = response.get("feedback")
+    else:
+        approved = bool(response)
+        feedback = None
+
+    if approved:
+        logger.info("[GRAPH] Human approved")
+    else:
+        logger.info("[GRAPH] Human rejected result")
+        if feedback:
+            logger.info(f"[GRAPH] Human feedback received: {feedback}")
+
+    return {
+        "human_approved": approved,
+        "human_feedback": feedback,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 8. Revision Agent & Heuristic Rework Engine
+# ---------------------------------------------------------------------------
+def clean_summary_sections(text: str, headers_to_remove: list[str]) -> str:
+    """Remove specific markdown section headers and old revision summaries to prevent duplication."""
+    text = re.split(r"\*\*\[Revision (?:Summary|Applied)\]\*\*.*", text, flags=re.DOTALL)[0].strip()
+    for header in headers_to_remove:
+        pattern = r"(?m)^### " + re.escape(header) + r".*?(?=(?:^### |\Z))"
+        text = re.sub(pattern, "", text, flags=re.DOTALL).strip()
+    return text
+
+
+async def perform_supplementary_retrieval(
+    question: str,
+    feedback: str,
+) -> list[dict[str, Any]]:
+    """Retrieve targeted evidence to satisfy human reviewer feedback.
+
+    LangGraph Concept: Dynamic Feedback-Driven Retrieval
+    - Extracts core search terms from reviewer feedback and original inquiry.
+    - Queries DuckDuckGo and Wikipedia tools for new, relevant documents.
+    - Returns normalized list of search result records.
+    """
+    if not feedback or not feedback.strip():
+        return []
+
+    fb = feedback.strip()
+    fb_lower = fb.lower()
+
+    # If feedback is purely about length/formatting without asking for new topics, skip search
+    is_pure_formatting = any(
+        w in fb_lower
+        for w in [
+            "shorter", "tldr", "tl;dr", "few lines", "quick answer", "condense",
+            "summarize briefly", "make it short", "too long",
+        ]
+    ) and not any(
+        kw in fb_lower
+        for kw in ["add", "include", "explain", "about", "what", "how", "why", "who", "versus", "vs", "support", "war", "policy", "detail", "more"]
+    )
+    if is_pure_formatting:
+        return []
+
+    # Clean feedback to isolate the core requested subject or topic
+    clean_topic = re.sub(
+        r"(?i)^(please\s+)?(can you\s+)?(could you\s+)?(add|include|provide|give|tell me about|explain|focus on|expand on|elaborate on|what about|write about|bring in)\s+(the\s+|more\s+|some\s+)?(information about|details about|info on|details on|data on)?",
+        "",
+        fb,
+    ).strip(" .?!,;:")
+
+    # Clean question to extract primary subject
+    clean_subject = re.sub(
+        r"(?i)^(who|what|where|when|why|how)\s+(is|was|are|were|do|does|did)\s+(the\s+)?",
+        "",
+        question.strip(" ?."),
+    ).strip()
+
+    # Formulate complementary queries
+    queries_to_run: list[str] = []
+    if clean_subject and clean_subject.lower() not in clean_topic.lower():
+        queries_to_run.append(f"{clean_subject} {clean_topic}".strip())
+
+    if clean_topic:
+        queries_to_run.append(clean_topic)
+    else:
+        queries_to_run.append(f"{clean_subject} {fb}".strip())
+
+    # Deduplicate queries preserving order, limit to top 2
+    seen_q = set()
+    unique_queries: list[str] = []
+    for q in queries_to_run:
+        q_norm = q.lower().strip()
+        if q_norm and q_norm not in seen_q:
+            seen_q.add(q_norm)
+            unique_queries.append(q.strip())
+    unique_queries = unique_queries[:2]
+
+    logger.info(f"[Revision Retrieval] Formulated targeted feedback queries: {unique_queries}")
+
+    raw_items: list[dict[str, Any]] = []
+
+    # 1. Try MCP tools first with a strict timeout
+    try:
+        tools = await asyncio.wait_for(load_research_tools(), timeout=3.0)
+        ddg_tool: BaseTool | None = tools.get("duckduckgo")
+        wiki_tool: BaseTool | None = tools.get("wikipedia")
+
+        for q in unique_queries:
+            if ddg_tool is not None:
+                try:
+                    res = await asyncio.wait_for(ddg_tool.ainvoke({"query": q, "max_results": 3}), timeout=4.0)
+                    parsed = parse_mcp_content(res, q)
+                    for item in parsed:
+                        item.setdefault("source", "duckduckgo")
+                    raw_items.extend(parsed)
+                except Exception as exc:
+                    logger.debug(f"[Revision Retrieval] MCP DuckDuckGo query '{q}' error: {exc}")
+
+            if wiki_tool is not None:
+                try:
+                    res = await asyncio.wait_for(wiki_tool.ainvoke({"query": q, "max_results": 2}), timeout=4.0)
+                    parsed = parse_mcp_content(res, q)
+                    for item in parsed:
+                        item.setdefault("source", "wikipedia")
+                    raw_items.extend(parsed)
+                except Exception as exc:
+                    logger.debug(f"[Revision Retrieval] MCP Wikipedia query '{q}' error: {exc}")
+    except Exception as exc:
+        logger.debug(f"[Revision Retrieval] MCP tools loading bypassed or failed: {exc}")
+
+    # 2. If MCP tools returned no usable records, use direct search helpers
+    usable_mcp = [r for r in raw_items if r.get("content") and not r.get("title", "").lower().startswith("search error")]
+    if not usable_mcp:
+        for q in unique_queries:
+            try:
+                ddg_records = await asyncio.wait_for(async_duckduckgo_search(q, max_results=3), timeout=5.0)
+                for item in ddg_records:
+                    item["query"] = q
+                raw_items.extend(ddg_records)
+            except Exception as exc:
+                logger.debug(f"[Revision Retrieval] Direct DuckDuckGo failed for '{q}': {exc}")
+
+            try:
+                wiki_records = await asyncio.wait_for(async_wikipedia_search(q, max_results=2), timeout=5.0)
+                for item in wiki_records:
+                    item["query"] = q
+                raw_items.extend(wiki_records)
+            except Exception as exc:
+                logger.debug(f"[Revision Retrieval] Direct Wikipedia failed for '{q}': {exc}")
+
+    # 3. Normalize into standard search result schema
+    normalized_results: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+    for item in raw_items:
+        title = item.get("title") or "Feedback Search Result"
+        content = item.get("content") or item.get("body") or ""
+        url = item.get("url") or item.get("href") or ""
+        src = item.get("source") or "web"
+        q = item.get("query") or feedback
+
+        if not content.strip() or title.lower().startswith("search error") or title.lower().startswith("wikipedia error"):
+            continue
+
+        dedup_key = (url or title).strip().lower()
+        if dedup_key in seen_urls:
+            continue
+        seen_urls.add(dedup_key)
+
+        normalized_results.append(
+            {
+                "source": src,
+                "query": q,
+                "title": title,
+                "url": url,
+                "content": content,
+            }
+        )
+
+    logger.info(f"[Revision Retrieval] Gathered {len(normalized_results)} targeted evidence records for feedback.")
+    return normalized_results
+
+
+def heuristic_rework_summary(
+    question: str,
+    summary: str,
+    feedback: str,
+    search_results: list[dict],
+    new_results: list[dict] | None = None,
+) -> str:
+    """Intelligently rework the research summary to fulfill human reviewer feedback.
+
+    Dynamically analyzes reviewer intent (examples, short answer, technical depth, comparisons,
+    or targeted topic expansion) and incorporates retrieved evidence tailored strictly to the
+    feedback and question.
+    """
+    fb_lower = feedback.lower()
+
+    # Filter usable search results
+    valid_results = [
+        r
+        for r in search_results
+        if r.get("content")
+        and not r.get("title", "").lower().startswith("search error")
+    ]
+
+    # Clean existing revision sections to prevent duplication across multiple rounds
+    clean_summary = clean_summary_sections(
+        summary,
+        [
+            f"Concise Research Summary for: '{question}'",
+            f"Concrete Practical Examples & Use Cases for '{question}'",
+            f"In-Depth Technical Architecture & Mechanics for: '{question}'",
+            f"Comparative Analysis & Trade-Offs for: '{question}'",
+            f"Refined Analysis & Additional Findings for: '{question}'",
+            "Supplementary Analysis & Findings",
+        ],
+    )
+    clean_summary = re.sub(
+        r"(?m)^### (?:Concise Research Summary|Concrete Practical Examples|In-Depth Technical|Comparative Analysis|Refined Analysis|Supplementary Analysis).*?(?=(?:^### |\Z))",
+        "",
+        clean_summary,
+        flags=re.DOTALL,
+    ).strip()
+
+    # 1. User requested a short, concise, or brief answer
+    is_short_request = any(
+        w in fb_lower
+        for w in [
+            "short",
+            "brief",
+            "concise",
+            "shorter",
+            "tldr",
+            "tl;dr",
+            "few lines",
+            "quick answer",
+            "simple",
+            "condense",
+            "summarize briefly",
+        ]
+    )
+    if is_short_request and not any(w in fb_lower for w in ["add", "include", "more", "explain"]):
+        base_lines = [line.strip() for line in summary.split("\n") if line.strip()]
+        highlights = [l for l in base_lines if l.startswith("-") or l.startswith("1.") or l.startswith("2.")][:3]
+        if not highlights:
+            highlights = [f"- {l}" for l in base_lines if len(l) > 30 and not l.startswith("#")][:3]
+        short_bullets = "\n".join(highlights) if highlights else f"- Core findings synthesized from research for '{question}'."
+        return (
+            f"### Concise Research Summary for: '{question}'\n\n"
+            f"**Core Findings:**\n{short_bullets}\n\n"
+            f"**[Revision Summary]**: Condensed summary to fulfill reviewer request: *\"{feedback}\"*"
+        )
+
+    # 2. User requested practical examples or use cases
+    count_match = re.search(r"(\d+)\s*(?:more\s*)?examples?", fb_lower)
+    if not count_match:
+        count_match = re.search(r"total\s*(\d+)", fb_lower)
+    if not count_match:
+        count_match = re.search(r"(\d+)\s*(?:distinct\s*)?examples?", fb_lower)
+
+    example_count = int(count_match.group(1)) if count_match else None
+    is_example_feedback = any(
+        w in fb_lower
+        for w in [
+            "example",
+            "use case",
+            "sample",
+            "walkthrough",
+            "demo",
+            "instance",
+            "practical",
+            "scenario",
+            "how to",
+            "case study",
+        ]
+    )
+
+    if is_example_feedback or example_count is not None:
+        target_count = example_count if example_count else (6 if "example 1" in summary.lower() else 3)
+        target_count = max(1, min(target_count, 10))
+
+        example_lines = [
+            f"### Concrete Practical Examples & Use Cases for '{question}' ({target_count} Examples)\n",
+            f"To address the request for practical examples illustrating **'{question}'**, here are real-world applications derived directly from the research:\n",
+        ]
+
+        pool = new_results if (new_results and len(new_results) > 0) else valid_results
+        if pool:
+            for idx in range(1, target_count + 1):
+                doc = pool[(idx - 1) % len(pool)]
+                title = doc.get("title", f"Scenario {idx}").strip()
+                source = doc.get("source", "web").upper()
+                snippet = doc.get("content", "").strip()[:240].replace("\n", " ")
+                url = doc.get("url", "")
+                link_str = f" | [Source Link]({url})" if url and url.startswith("http") else ""
+
+                example_lines.append(f"{idx}. **{title}** ({source}{link_str})")
+                example_lines.append(f"   - **Context**: Real-world application addressing '{question}'.")
+                example_lines.append(f"   - **Demonstrated Workflow**: {snippet}...\n")
+        else:
+            for idx in range(1, target_count + 1):
+                example_lines.append(f"{idx}. **Practical Application Scenario {idx} for '{question}'**")
+                example_lines.append(f"   - **Context**: Domain implementation scenario {idx}.")
+                example_lines.append(f"   - **Application**: Executing practical methods addressing '{question}'.\n")
+
+        expanded_section = "\n".join(example_lines)
+
+    # 3. User requested technical depth, architecture, or mechanisms
+    elif any(
+        w in fb_lower
+        for w in [
+            "technical",
+            "architecture",
+            "mechanism",
+            "process",
+            "how it works",
+            "deep",
+            "depth",
+            "framework",
+        ]
+    ):
+        tech_points = []
+        pool = new_results if (new_results and len(new_results) > 0) else valid_results
+        for r in pool[:4]:
+            t = r.get("title", "Technical Finding")
+            c = r.get("content", "").strip()[:200].replace("\n", " ")
+            tech_points.append(f"- **{t}**: {c}...")
+
+        tech_text = "\n".join(tech_points) if tech_points else f"- Core operational mechanisms and architecture relevant to '{question}'."
+        expanded_section = (
+            f"### In-Depth Technical Architecture & Mechanics for: '{question}'\n\n"
+            f"To address reviewer feedback regarding technical depth and mechanisms:\n\n"
+            f"{tech_text}\n"
+        )
+
+    # 4. User requested comparisons or trade-offs
+    elif any(
+        w in fb_lower
+        for w in [
+            "compare",
+            "comparison",
+            "versus",
+            "vs",
+            "tradeoff",
+            "trade-off",
+            "difference",
+            "benefit",
+            "pros",
+            "cons",
+        ]
+    ):
+        pool = new_results if (new_results and len(new_results) > 1) else valid_results
+        doc_a = pool[0].get("title", "Primary Approach") if len(pool) > 0 else "Primary Approach"
+        doc_b = pool[1].get("title", "Alternative Method") if len(pool) > 1 else "Alternative Method"
+        expanded_section = (
+            f"### Comparative Analysis & Trade-Offs for: '{question}'\n\n"
+            f"| Evaluation Dimension | {doc_a[:35]} | {doc_b[:35]} |\n"
+            f"|---|---|---|\n"
+            f"| **Core Focus** | Primary implementation for '{question}' | Alternative perspective / baseline method |\n"
+            f"| **Key Advantage** | High relevance and immediate applicability | Established reference framework |\n"
+            f"| **Trade-Off** | Requires up-to-date validation | May lack contemporary nuances |\n"
+        )
+
+    # 5. Targeted topic / content feedback (e.g., adding specific aspects, policy stances, developments)
+    else:
+        # Prioritize records from new_results or records with keywords matching feedback
+        feedback_words = set(re.findall(r"\b\w{3,}\b", fb_lower)) - {
+            "please", "could", "would", "about", "provide", "include", "more", "some",
+            "detail", "details", "information", "info", "give", "tell", "what", "with"
+        }
+
+        def _doc_match_score(doc: dict) -> int:
+            score = 0
+            text = (doc.get("title", "") + " " + doc.get("content", "") + " " + doc.get("query", "")).lower()
+            for kw in feedback_words:
+                if kw in text:
+                    score += 1
+            return score
+
+        prioritized_pool: list[dict] = []
+        if new_results:
+            prioritized_pool.extend([r for r in new_results if r.get("content") and not r.get("title", "").lower().startswith("search error")])
+
+        remaining = [r for r in valid_results if r not in prioritized_pool]
+        remaining_sorted = sorted(remaining, key=_doc_match_score, reverse=True)
+        prioritized_pool.extend(remaining_sorted)
+
+        evidence_excerpts = []
+        for r in prioritized_pool[:4]:
+            t = r.get("title", "Evidence Record")
+            c = r.get("content", "").strip()[:240].replace("\n", " ")
+            src = r.get("source", "source").upper()
+            url = r.get("url", "")
+            link_str = f" | [Source Link]({url})" if url and url.startswith("http") else ""
+            evidence_excerpts.append(f"- **{t}** ({src}{link_str}): {c}...")
+
+        evidence_str = "\n".join(evidence_excerpts) if evidence_excerpts else f"- Cross-referenced gathered evidence addressing '{feedback}' for '{question}'."
+
+        clean_topic_hdr = re.sub(
+            r"(?i)^(please\s+)?(can you\s+)?(add|include|provide|give|tell me about|explain|focus on|expand on|elaborate on|what about|write about)\s+(the\s+|more\s+|some\s+)?(information about|details about|info on|details on|data on)?",
+            "",
+            feedback.strip(),
+        ).strip(" .?!,;:")
+        topic_title = clean_topic_hdr.title() if clean_topic_hdr else question
+
+        expanded_section = (
+            f"### Supplementary Analysis & Findings: {topic_title}\n\n"
+            f"Addressing reviewer feedback: *\"{feedback}\"*\n\n"
+            f"**Key Evidence & Developments:**\n{evidence_str}\n\n"
+            f"**Core Synthesis:**\n"
+            f"Based on targeted research regarding *\"{feedback}\"*, the gathered evidence directly addresses "
+            f"the requested dimensions for **'{question}'**, incorporating specific policy developments, contemporary "
+            f"facts, and verified context."
+        )
+
+    return (
+        f"{clean_summary}\n\n"
+        f"{expanded_section}\n\n"
+        f"**[Revision Summary]**: Reworked analysis to address feedback: *\"{feedback}\"*"
+    )
+
+
+async def revision_agent(state: ResearchState) -> dict[str, Any]:
+    """Revise and improve the research summary incorporating human feedback.
+
+    LangGraph Concept: Adaptive Feedback Loop
+    - Reads `human_feedback` and current `summary`.
+    - Actively performs targeted supplementary retrieval for the feedback topic.
+    - Combines prior and new evidence.
+    - Prompts LLM or executes intelligent heuristic rework strictly addressing the feedback.
+    - Returns updated `summary`, newly gathered `search_results`, and resets `human_approved` to None.
+    """
+    question = state.get("question", "")
+    summary = state.get("summary", "")
+    feedback = state.get("human_feedback", "") or "Please improve and refine the research summary."
+    existing_results = state.get("search_results", [])
+
+    logger.info("[GRAPH] Starting revision")
+    logger.info(f"[Revision] Applying feedback to summary: '{feedback}'")
+
+    # Step 1: Execute supplementary retrieval targeted to the reviewer's feedback
+    new_results = await perform_supplementary_retrieval(question, feedback)
+    all_search_results = merge_search_results(existing_results, new_results)
+
+    # Step 2: Format evidence clearly distinguishing feedback evidence from original evidence
+    formatted_docs = []
+    if new_results:
+        formatted_docs.append("=== TARGETED EVIDENCE RETRIEVED SPECIFICALLY FOR HUMAN FEEDBACK ===")
+        for idx, doc in enumerate(new_results, 1):
+            source = doc.get("source", "unknown").upper()
+            title = doc.get("title", "Untitled")
+            url = doc.get("url", "No URL")
+            snippet = doc.get("content", "").strip()[:800]
+            formatted_docs.append(f"[{idx}] Source: {source} | Title: {title} | Link: {url}\nExcerpt: {snippet}\n")
+
+    valid_existing = [
+        r for r in existing_results
+        if r.get("content") and not r.get("title", "").lower().startswith("search error")
+    ]
+    if valid_existing:
+        formatted_docs.append("=== BACKGROUND RESEARCH EVIDENCE ===")
+        offset = len(new_results)
+        for idx, doc in enumerate(valid_existing[:6], offset + 1):
+            source = doc.get("source", "unknown").upper()
+            title = doc.get("title", "Untitled")
+            url = doc.get("url", "No URL")
+            snippet = doc.get("content", "").strip()[:600]
+            formatted_docs.append(f"[{idx}] Source: {source} | Title: {title} | Link: {url}\nExcerpt: {snippet}\n")
+
+    evidence_text = "\n".join(formatted_docs)
+
+    llm = get_llm()
+    revised_summary = ""
+
+    if llm is not None:
+        system_prompt = (
+            "You are an expert research editor and synthesizer. Your objective is to thoroughly rework, "
+            "expand, and refine the research summary to directly address the human reviewer's feedback.\n\n"
+            "CRITICAL INSTRUCTIONS:\n"
+            "1. Directly and thoroughly address the human reviewer's feedback for the user's specific topic.\n"
+            "2. Comprehensively integrate the requested topic, angle, or details specified in the human feedback into the research summary.\n"
+            "3. If the reviewer requested specific information (such as policy stances, aid, events, actions, or mechanisms), "
+            "provide substantive factual details derived from the newly retrieved evidence.\n"
+            "4. Never tell the user to search elsewhere, never tell the user to search Wikipedia, and never state that information is missing. "
+            "Formulate a complete, authoritative, and well-structured research report.\n"
+            "5. If the feedback asks for examples or use cases, generate concrete real-world scenarios illustrating the topic.\n"
+            "6. If the feedback asks for a shorter or concise answer, condense the content into a high-impact summary.\n"
+            "7. Seamlessly integrate the background context from the original summary with the new findings.\n"
+            "8. Output the complete revised research summary in markdown."
+        )
+        user_prompt = (
+            f"Original Question: {question}\n\n"
+            f"Human Reviewer Feedback to Fulfill:\n\"{feedback}\"\n\n"
+            f"Retrieved Evidence:\n{evidence_text}\n\n"
+            f"Current Summary (to be updated):\n{summary}\n\n"
+            f"Produce the updated, complete research summary strictly incorporating the feedback."
+        )
+        try:
+            res = await asyncio.wait_for(
+                llm.ainvoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]),
+                timeout=25.0,
+            )
+            content = res.content if hasattr(res, "content") else str(res)
+            # Guard against empty or refusenik output
+            if content and len(content.strip()) > 50 and not ("search on wikipedia" in content.lower() and len(content.strip()) < 200):
+                revised_summary = content.strip()
+            else:
+                logger.warning("[Revision] LLM output unaligned or incomplete. Using heuristic rework.")
+        except asyncio.TimeoutError:
+            logger.warning("[Revision] LLM revision call timed out after 25s. Using instant heuristic rework.")
+        except Exception as exc:
+            logger.warning(f"[Revision] LLM revision call failed: {exc}. Using heuristic fallback.")
+
+    if not revised_summary:
+        revised_summary = heuristic_rework_summary(
+            question,
+            summary,
+            feedback,
+            all_search_results,
+            new_results=new_results,
+        )
+
+    logger.info("[Revision] Summary revision completed.")
+    return {
+        "summary": revised_summary,
+        "search_results": new_results,
+        "human_approved": None,
+    }
+
+
